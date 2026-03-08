@@ -1,0 +1,283 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: mini-ms-dpumesh
+---
+# ===== DPA Daemon (DMA Manager) =====
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: dpa-daemon
+  namespace: mini-ms-dpumesh
+  labels:
+    app: dpa-daemon
+spec:
+  selector:
+    matchLabels:
+      app: dpa-daemon
+  template:
+    metadata:
+      labels:
+        app: dpa-daemon
+    spec:
+      hostNetwork: true
+      hostPID: true
+      containers:
+      - name: dpa-daemon
+        image: dpumesh-dpa:latest
+        imagePullPolicy: Never
+        env:
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        - name: SHM_PREFIX
+          value: "minims"
+        - name: PYTHONUNBUFFERED
+          value: "1"
+        volumeMounts:
+        - name: shm
+          mountPath: /dev/shm
+        securityContext:
+          privileged: true
+      volumes:
+      - name: shm
+        hostPath:
+          path: /dev/shm
+          type: Directory
+      tolerations:
+      - operator: Exists
+---
+# ===== DPU Daemon (Sidecar / TCP Bridge) =====
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: dpu-daemon
+  namespace: mini-ms-dpumesh
+  labels:
+    app: dpu-daemon
+spec:
+  selector:
+    matchLabels:
+      app: dpu-daemon
+  template:
+    metadata:
+      labels:
+        app: dpu-daemon
+    spec:
+      hostNetwork: true
+      containers:
+      - name: dpu-daemon
+        image: dpumesh-dpu:latest
+        imagePullPolicy: Never
+        ports:
+        - containerPort: 5060
+          hostPort: 5060
+          name: bridge
+        env:
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        - name: NAMESPACE
+          value: "mini-ms-dpumesh"
+        - name: SHM_PREFIX
+          value: "minims"
+        - name: DPUMESH_PORT
+          value: "5060"
+        - name: PYTHONUNBUFFERED
+          value: "1"
+        volumeMounts:
+        - name: shm
+          mountPath: /dev/shm
+        securityContext:
+          privileged: true
+      volumes:
+      - name: shm
+        hostPath:
+          path: /dev/shm
+          type: Directory
+      tolerations:
+      - operator: Exists
+---
+# ===== Frontend Worker =====
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: frontend-worker
+  namespace: mini-ms-dpumesh
+  labels:
+    app: frontend-worker
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: frontend-worker
+  template:
+    metadata:
+      labels:
+        app: frontend-worker
+    spec:
+      containers:
+      - name: worker
+        image: mini-ms-frontend-dpumesh:latest
+        imagePullPolicy: Never
+        env:
+        - name: APP
+          value: "frontend"
+        - name: SHM_PREFIX
+          value: "minims"
+        - name: WORKER_ID
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        - name: NAMESPACE
+          value: "mini-ms-dpumesh"
+        - name: ID_SERVICE_NAME
+          value: "id-service"
+        - name: ATTEND_SERVICE_NAME
+          value: "attend-service"
+        volumeMounts:
+        - name: shm
+          mountPath: /dev/shm
+      volumes:
+      - name: shm
+        hostPath:
+          path: /dev/shm
+          type: Directory
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: frontend
+  namespace: mini-ms-dpumesh
+spec:
+  selector:
+    app: frontend-worker
+  ports:
+  - port: 80
+    targetPort: 8080
+---
+# ===== ID Service Worker =====
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: id-service-worker
+  namespace: mini-ms-dpumesh
+  labels:
+    app: id-service-worker
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: id-service-worker
+  template:
+    metadata:
+      labels:
+        app: id-service-worker
+    spec:
+      containers:
+      - name: worker
+        image: mini-ms-id-service-dpumesh:latest
+        imagePullPolicy: Never
+        env:
+        - name: APP
+          value: "id-service"
+        - name: SHM_PREFIX
+          value: "minims"
+        - name: DATA_FILE
+          value: "data/ids.json"
+        - name: WORKER_ID
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        - name: NAMESPACE
+          value: "mini-ms-dpumesh"
+        volumeMounts:
+        - name: shm
+          mountPath: /dev/shm
+      volumes:
+      - name: shm
+        hostPath:
+          path: /dev/shm
+          type: Directory
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: id-service
+  namespace: mini-ms-dpumesh
+spec:
+  selector:
+    app: id-service-worker
+  ports:
+  - port: 80
+    targetPort: 8080
+---
+# ===== Attend Service Worker =====
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: attend-service-worker
+  namespace: mini-ms-dpumesh
+  labels:
+    app: attend-service-worker
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: attend-service-worker
+  template:
+    metadata:
+      labels:
+        app: attend-service-worker
+    spec:
+      containers:
+      - name: worker
+        image: mini-ms-attend-service-dpumesh:latest
+        imagePullPolicy: Never
+        env:
+        - name: APP
+          value: "attend-service"
+        - name: SHM_PREFIX
+          value: "minims"
+        - name: DATA_FILE
+          value: "data/attendance.json"
+        - name: WORKER_ID
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        - name: NAMESPACE
+          value: "mini-ms-dpumesh"
+        volumeMounts:
+        - name: shm
+          mountPath: /dev/shm
+      volumes:
+      - name: shm
+        hostPath:
+          path: /dev/shm
+          type: Directory
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: attend-service
+  namespace: mini-ms-dpumesh
+spec:
+  selector:
+    app: attend-service-worker
+  ports:
+  - port: 80
+    targetPort: 8080
