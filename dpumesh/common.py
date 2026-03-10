@@ -222,6 +222,7 @@ class BufferPool:
         try:
             fd = os.open(self.shm_path, os.O_RDWR | os.O_CREAT, 0o666)
             try:
+                os.chmod(self.shm_path, 0o666)
                 os.ftruncate(fd, self.total_size)
                 mm = mmap.mmap(fd, self.total_size)
                 mm.seek(0)
@@ -232,7 +233,7 @@ class BufferPool:
                 os.close(fd)
             if not os.path.exists(self.lock_path):
                 with open(self.lock_path, 'a+') as f:
-                    pass
+                    os.chmod(self.lock_path, 0o666)
         except Exception as e:
             print(f"[BufferPool] Init error {self.name}: {e}")
 
@@ -330,6 +331,7 @@ class DescriptorRing:
         try:
             fd = os.open(self.shm_path, os.O_RDWR | os.O_CREAT, 0o666)
             try:
+                os.chmod(self.shm_path, 0o666)
                 os.ftruncate(fd, self.total_size)
                 mm = mmap.mmap(fd, self.total_size)
                 mm.seek(0)
@@ -340,7 +342,7 @@ class DescriptorRing:
                 os.close(fd)
             if not os.path.exists(self.lock_path):
                 with open(self.lock_path, 'a+') as f:
-                    pass
+                    os.chmod(self.lock_path, 0o666)
         except Exception as e:
             print(f"[DescriptorRing] Init error {self.name}: {e}")
 
@@ -519,13 +521,14 @@ class PodRegistry:
         if not os.path.exists(cls.LOCK_PATH):
             try:
                 with open(cls.LOCK_PATH, 'a+') as f:
-                    pass
+                    os.chmod(cls.LOCK_PATH, 0o666)
             except Exception:
                 pass
         if not os.path.exists(cls.REGISTRY_PATH):
             try:
                 with open(cls.REGISTRY_PATH, 'w') as f:
                     json.dump({}, f)
+                os.chmod(cls.REGISTRY_PATH, 0o666)
             except Exception:
                 pass
 

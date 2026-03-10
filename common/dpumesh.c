@@ -60,6 +60,7 @@ static int bp_init(buffer_pool_t *bp, const char *name, int create) {
     if (create) {
         int fd = open(bp->shm_path, O_RDWR | O_CREAT, 0666);
         if (fd < 0) { perror("bp_init create"); return -1; }
+        fchmod(fd, 0666);
         if (ftruncate(fd, bp->total_size) < 0) { close(fd); return -1; }
         void *m = mmap(NULL, bp->total_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
         if (m == MAP_FAILED) { close(fd); return -1; }
@@ -69,7 +70,7 @@ static int bp_init(buffer_pool_t *bp, const char *name, int create) {
         close(fd);
         /* create lock file */
         int lf = open(bp->lock_path, O_CREAT | O_WRONLY, 0666);
-        if (lf >= 0) close(lf);
+        if (lf >= 0) { fchmod(lf, 0666); close(lf); }
     }
 
     /* open for use */
@@ -167,6 +168,7 @@ static int dr_init(desc_ring_t *dr, const char *name, int create) {
     if (create) {
         int fd = open(dr->shm_path, O_RDWR | O_CREAT, 0666);
         if (fd < 0) return -1;
+        fchmod(fd, 0666);
         if (ftruncate(fd, dr->total_size) < 0) { close(fd); return -1; }
         void *m = mmap(NULL, dr->total_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
         if (m == MAP_FAILED) { close(fd); return -1; }
@@ -175,7 +177,7 @@ static int dr_init(desc_ring_t *dr, const char *name, int create) {
         munmap(m, dr->total_size);
         close(fd);
         int lf = open(dr->lock_path, O_CREAT | O_WRONLY, 0666);
-        if (lf >= 0) close(lf);
+        if (lf >= 0) { fchmod(lf, 0666); close(lf); }
     }
 
     dr->shm_fd = open(dr->shm_path, O_RDWR);
@@ -264,6 +266,7 @@ static int pod_registry_alloc_id(void) {
     /* Create lock file if needed */
     int lf = open(pod_counter_lock(), O_CREAT | O_RDWR, 0666);
     if (lf < 0) return -1;
+    fchmod(lf, 0666);
     flock(lf, LOCK_EX);
 
     int new_id = 1;
@@ -276,6 +279,7 @@ static int pod_registry_alloc_id(void) {
     }
     f = fopen(pod_counter_path(), "w");
     if (f) { fprintf(f, "%d", new_id); fclose(f); }
+    chmod(pod_counter_path(), 0666);
 
     flock(lf, LOCK_UN);
     close(lf);
@@ -285,6 +289,7 @@ static int pod_registry_alloc_id(void) {
 static int pod_registry_register(const char *worker_name, int pod_id, const char *service) {
     int lf = open(registry_lock(), O_CREAT | O_RDWR, 0666);
     if (lf < 0) return -1;
+    fchmod(lf, 0666);
     flock(lf, LOCK_EX);
 
     /* Read existing JSON */
@@ -314,6 +319,7 @@ static int pod_registry_register(const char *worker_name, int pod_id, const char
 
     f = fopen(registry_path(), "w");
     if (f) { fputs(newbuf, f); fclose(f); }
+    chmod(registry_path(), 0666);
 
     flock(lf, LOCK_UN);
     close(lf);

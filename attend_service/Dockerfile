@@ -1,10 +1,14 @@
 FROM gcc:13-bookworm AS build
 WORKDIR /build
+RUN apt-get update && apt-get install -y libevent-dev && rm -rf /var/lib/apt/lists/*
 COPY common/ common/
 COPY attend_service/main.c .
-RUN gcc -O2 -Wall -Wextra -Icommon -o server main.c common/*.c
+RUN gcc -O2 -Wall -Wextra -Icommon -o server main.c \
+    common/json_util.c common/http_parse.c common/tcp_handler.c \
+    -levent
 
 FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y libevent-2.1-7 && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY --from=build /build/server .
 COPY attend_service/data/ data/

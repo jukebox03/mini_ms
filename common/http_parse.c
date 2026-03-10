@@ -4,9 +4,13 @@
 #include <stdlib.h>
 
 static const char *find_header_end(const char *buf, size_t len) {
-    for (size_t i = 0; i + 3 < len; i++) {
-        if (buf[i] == '\r' && buf[i+1] == '\n' && buf[i+2] == '\r' && buf[i+3] == '\n')
+    for (size_t i = 0; i + 1 < len; i++) {
+        /* Check for \r\n\r\n */
+        if (i + 3 < len && buf[i] == '\r' && buf[i+1] == '\n' && buf[i+2] == '\r' && buf[i+3] == '\n')
             return buf + i + 4;
+        /* Check for \n\n */
+        if (buf[i] == '\n' && buf[i+1] == '\n')
+            return buf + i + 2;
     }
     return NULL;
 }
