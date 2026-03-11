@@ -11,32 +11,32 @@
 #include "json_util.h"
 #include "http_parse.h"
 #include "tcp_handler.h"
-#include "dpumesh_adapter.h"
+#include "dpumesh_handler.h"
 
 static kv_store_t store;
 static dpumesh_ctx_t *dpu_ctx;
 
 static void handle_request(conn_t *client, http_request_t *req) {
     if (strcmp(req->method, "GET") != 0 || strcmp(req->path, "/attend") != 0) {
-        dpumesh_conn_respond(client, dpu_ctx, 404, "{\"error\":\"not found\"}", 20);
+        dpumesh_conn_respond(client,404, "{\"error\":\"not found\"}", 20);
         return;
     }
 
     char id_str[32];
     if (query_get(req->query, "id", id_str, sizeof(id_str)) != 0) {
-        dpumesh_conn_respond(client, dpu_ctx, 400, "{\"error\":\"missing id\"}", 21);
+        dpumesh_conn_respond(client,400, "{\"error\":\"missing id\"}", 21);
         return;
     }
 
     const int *attended = kv_store_get(&store, id_str);
     if (!attended) {
-        dpumesh_conn_respond(client, dpu_ctx, 404, "{\"error\":\"id not found\"}", 23);
+        dpumesh_conn_respond(client,404, "{\"error\":\"id not found\"}", 23);
         return;
     }
 
     char body[128];
     int blen = snprintf(body, sizeof(body), "{\"attended\":%s}", *attended ? "true" : "false");
-    dpumesh_conn_respond(client, dpu_ctx, 200, body, blen);
+    dpumesh_conn_respond(client,200, body, blen);
 }
 
 int main(void) {
@@ -61,10 +61,7 @@ int main(void) {
         return 1;
     }
 
-    struct event_base *base = event_base_new();
-    dpumesh_adapter_init(base, dpu_ctx, handle_request);
-    event_base_dispatch(base);
-    event_base_free(base);
+    dpumesh_run(dpu_ctx, handle_request);
 
     dpumesh_destroy(dpu_ctx);
     return 0;

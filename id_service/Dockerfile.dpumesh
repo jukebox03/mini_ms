@@ -5,7 +5,7 @@ COPY common/ common/
 COPY id_service/main_dpumesh.c .
 RUN gcc -O2 -Wall -Icommon -o server main_dpumesh.c \
     common/json_util.c common/http_parse.c common/tcp_handler.c \
-    common/dpumesh.c common/dpumesh_adapter.c \
+    common/dpumesh.c common/dpumesh_handler.c \
     -levent -lpthread
 
 FROM debian:bookworm-slim

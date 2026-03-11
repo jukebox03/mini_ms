@@ -16,8 +16,8 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/file.h>
-#include <sys/timerfd.h>
 #include <time.h>
+#include <pthread.h>
 
 /* Runtime SHM prefix (configurable via SHM_PREFIX env var) */
 static const char *shm_prefix(void) {
@@ -439,7 +439,11 @@ struct dpumesh_ctx {
     char        app_name[64];
     char        worker_id[128];
     int         pod_id;
-    int         timer_fd;           /* notify fd (timerfd) */
+    int         notify_fd;          /* pipe read end — register with event loop */
+    int         notify_write_fd;    /* pipe write end — used by poller thread */
+    pthread_t   poller_tid;
+    volatile int poller_running;
+    volatile int notified;          /* prevent redundant pipe writes */
     uint32_t    next_req_id;
 
     /* Host buffer pools (per-service, shared) */
@@ -452,6 +456,39 @@ struct dpumesh_ctx {
     desc_ring_t   tx_sq;
     desc_ring_t   rx_sq;
 };
+
+
+/* ====================================================================
+ * Poller thread — polls SHM ring, signals notify pipe when data arrives
+ * ==================================================================== */
+
+static void *dpumesh_poller_fn(void *arg) {
+    dpumesh_ctx_t *ctx = arg;
+    int idle_count = 0;
+
+    while (ctx->poller_running) {
+        /* Peek at rx_sq count (relaxed read — just a hint) */
+        uint32_t *hdr = (uint32_t *)ctx->rx_sq.mm;
+        uint32_t count = hdr[2];
+
+        if (count > 0 && !ctx->notified) {
+            ctx->notified = 1;
+            char b = 1;
+            if (write(ctx->notify_write_fd, &b, 1) < 0) { /* ignore */ }
+            idle_count = 0;
+        } else if (count == 0) {
+            idle_count++;
+            if (idle_count > 10000) {
+                usleep(1000);           /* 1ms — deep idle */
+            } else if (idle_count > 100) {
+                usleep(100);            /* 100us — light idle */
+            }
+            /* else: busy poll */
+        }
+    }
+
+    return NULL;
+}
 
 
 /* ====================================================================
@@ -498,15 +535,21 @@ int dpumesh_init(dpumesh_ctx_t **out, const char *app_name, int worker_num) {
     snprintf(name, sizeof(name), "pod_%d_rx_sq", ctx->pod_id);
     if (dr_init(&ctx->rx_sq, name, 1) < 0) goto fail;
 
-    /* Create timerfd (1ms interval) for notify_fd */
-    ctx->timer_fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK);
-    if (ctx->timer_fd < 0) goto fail;
+    /* Create notification pipe + poller thread */
+    int pfd[2];
+    if (pipe(pfd) < 0) goto fail;
+    int flags = fcntl(pfd[0], F_GETFL, 0);
+    fcntl(pfd[0], F_SETFL, flags | O_NONBLOCK);
+    flags = fcntl(pfd[1], F_GETFL, 0);
+    fcntl(pfd[1], F_SETFL, flags | O_NONBLOCK);
 
-    struct itimerspec its = {
-        .it_interval = { .tv_sec = 0, .tv_nsec = 1000000 },  /* 1ms */
-        .it_value    = { .tv_sec = 0, .tv_nsec = 1000000 },
-    };
-    timerfd_settime(ctx->timer_fd, 0, &its, NULL);
+    ctx->notify_fd = pfd[0];
+    ctx->notify_write_fd = pfd[1];
+    ctx->notified = 0;
+    ctx->poller_running = 1;
+
+    if (pthread_create(&ctx->poller_tid, NULL, dpumesh_poller_fn, ctx) != 0)
+        goto fail;
 
     printf("[dpumesh] initialized: worker=%s pod_id=%d app=%s\n",
            ctx->worker_id, ctx->pod_id, ctx->app_name);
@@ -521,7 +564,10 @@ fail:
 
 void dpumesh_destroy(dpumesh_ctx_t *ctx) {
     if (!ctx) return;
-    if (ctx->timer_fd >= 0) close(ctx->timer_fd);
+    ctx->poller_running = 0;
+    pthread_join(ctx->poller_tid, NULL);
+    if (ctx->notify_fd >= 0) close(ctx->notify_fd);
+    if (ctx->notify_write_fd >= 0) close(ctx->notify_write_fd);
     bp_destroy(&ctx->tx_header);
     bp_destroy(&ctx->tx_body);
     bp_destroy(&ctx->rx_header);
@@ -532,7 +578,7 @@ void dpumesh_destroy(dpumesh_ctx_t *ctx) {
 }
 
 int dpumesh_get_notify_fd(dpumesh_ctx_t *ctx) {
-    return ctx->timer_fd;
+    return ctx->notify_fd;
 }
 
 int dpumesh_get_pod_id(dpumesh_ctx_t *ctx) {
@@ -546,9 +592,10 @@ const char *dpumesh_get_worker_id(dpumesh_ctx_t *ctx) {
 int dpumesh_poll(dpumesh_ctx_t *ctx,
                  dpumesh_on_response_fn on_resp, void *resp_data,
                  dpumesh_on_request_fn  on_req,  void *req_data) {
-    /* Drain timerfd */
-    uint64_t expirations;
-    if (read(ctx->timer_fd, &expirations, sizeof(expirations)) < 0) { /* non-blocking, ignore */ }
+    /* Drain notify pipe and allow poller to signal again */
+    char drain_buf[64];
+    while (read(ctx->notify_fd, drain_buf, sizeof(drain_buf)) > 0) {}
+    ctx->notified = 0;
 
     int count = 0;
     sw_descriptor_t desc;

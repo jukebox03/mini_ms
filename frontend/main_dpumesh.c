@@ -4,7 +4,7 @@
 #include "json_util.h"
 #include "http_parse.h"
 #include "tcp_handler.h"
-#include "dpumesh_adapter.h"
+#include "dpumesh_handler.h"
 
 static dpumesh_ctx_t *dpu_ctx;
 
@@ -27,20 +27,20 @@ static void handle_upstream_response(conn_t *upstream, http_response_t *resp);
 
 static void handle_request(conn_t *client, http_request_t *req) {
     if (strcmp(req->method, "GET") != 0 || strcmp(req->path, "/lookup") != 0) {
-        dpumesh_conn_respond(client, dpu_ctx, 404, "{\"error\":\"not found\"}", 20);
+        dpumesh_conn_respond(client,404, "{\"error\":\"not found\"}", 20);
         return;
     }
 
     char name[64];
     if (query_get(req->query, "name", name, sizeof(name)) != 0) {
-        dpumesh_conn_respond(client, dpu_ctx, 400, "{\"error\":\"missing name\"}", 23);
+        dpumesh_conn_respond(client,400, "{\"error\":\"missing name\"}", 23);
         return;
     }
 
     /* Stage 1: call id_service */
     frontend_ctx_t *ctx = calloc(1, sizeof(frontend_ctx_t));
     if (!ctx) {
-        dpumesh_conn_respond(client, dpu_ctx, 500, "{\"error\":\"alloc failed\"}", 23);
+        dpumesh_conn_respond(client,500, "{\"error\":\"alloc failed\"}", 23);
         return;
     }
     ctx->stage = STAGE_WAITING_ID;
@@ -51,9 +51,9 @@ static void handle_request(conn_t *client, http_request_t *req) {
     if (!ns) ns = "mini-ms-dpumesh";
     snprintf(url, sizeof(url), "http://%s.%s.svc.cluster.local/id?name=%s", id_service_name, ns, name);
 
-    if (dpumesh_conn_upstream(client, dpu_ctx, "GET", url, ctx) < 0) {
+    if (dpumesh_conn_upstream(client,"GET", url, ctx) < 0) {
         free(ctx);
-        dpumesh_conn_respond(client, dpu_ctx, 502, "{\"error\":\"upstream failed\"}", 26);
+        dpumesh_conn_respond(client,502, "{\"error\":\"upstream failed\"}", 26);
     }
 }
 
@@ -63,7 +63,7 @@ static void handle_upstream_response(conn_t *upstream, http_response_t *resp) {
     if (!client || !ctx) return;
 
     if (resp->status_code != 200) {
-        dpumesh_conn_respond(client, dpu_ctx, resp->status_code, resp->body, resp->body_len);
+        dpumesh_conn_respond(client,resp->status_code, resp->body, resp->body_len);
         free(ctx);
         return;
     }
@@ -72,7 +72,7 @@ static void handle_upstream_response(conn_t *upstream, http_response_t *resp) {
         /* Parse {"id": N} from id_service response */
         const char *p = strstr(resp->body, "\"id\":");
         if (!p) {
-            dpumesh_conn_respond(client, dpu_ctx, 502, "{\"error\":\"bad id response\"}", 26);
+            dpumesh_conn_respond(client,502, "{\"error\":\"bad id response\"}", 26);
             free(ctx);
             return;
         }
@@ -85,8 +85,8 @@ static void handle_upstream_response(conn_t *upstream, http_response_t *resp) {
         if (!ns) ns = "mini-ms-dpumesh";
         snprintf(url, sizeof(url), "http://%s.%s.svc.cluster.local/attend?id=%d", attend_service_name, ns, ctx->id);
 
-        if (dpumesh_conn_upstream(client, dpu_ctx, "GET", url, ctx) < 0) {
-            dpumesh_conn_respond(client, dpu_ctx, 502, "{\"error\":\"upstream failed\"}", 26);
+        if (dpumesh_conn_upstream(client,"GET", url, ctx) < 0) {
+            dpumesh_conn_respond(client,502, "{\"error\":\"upstream failed\"}", 26);
             free(ctx);
         }
     } else if (ctx->stage == STAGE_WAITING_ATTEND) {
@@ -99,7 +99,7 @@ static void handle_upstream_response(conn_t *upstream, http_response_t *resp) {
             "{\"name\":\"%s\",\"id\":%d,\"attended\":%s}",
             ctx->name, ctx->id, attended ? "true" : "false");
 
-        dpumesh_conn_respond(client, dpu_ctx, 200, body, blen);
+        dpumesh_conn_respond(client,200, body, blen);
         free(ctx);
     }
 }
@@ -123,11 +123,8 @@ int main(void) {
     printf("[frontend] DPUmesh mode: id_service=%s attend_service=%s\n",
            id_service_name, attend_service_name);
 
-    struct event_base *base = event_base_new();
-    dpumesh_adapter_init(base, dpu_ctx, handle_request);
-    dpumesh_adapter_set_upstream_handler(handle_upstream_response);
-    event_base_dispatch(base);
-    event_base_free(base);
+    dpumesh_handler_set_upstream(handle_upstream_response);
+    dpumesh_run(dpu_ctx, handle_request);
 
     dpumesh_destroy(dpu_ctx);
     return 0;

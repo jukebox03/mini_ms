@@ -37,6 +37,9 @@ int  conn_start_upstream(conn_t *client, const char *host, int port,
 void tcp_listen_start(struct event_base *base, int listen_fd,
                       request_handler_fn handler);
 
+/* Set upstream response handler (setter alternative to direct g_upstream_handler assignment) */
+void tcp_handler_set_upstream(upstream_handler_fn handler);
+
 /* Backward-compatible wrapper (minimal change for existing service code) */
 void epoll_run(int listen_fd, request_handler_fn handler);
 

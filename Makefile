@@ -1,7 +1,7 @@
 CC = gcc
 CFLAGS = -O2 -Wall -Wextra -Icommon
 COMMON_SRC = common/json_util.c common/http_parse.c common/tcp_handler.c
-DPUMESH_SRC = $(COMMON_SRC) common/dpumesh.c common/dpumesh_adapter.c
+DPUMESH_SRC = $(COMMON_SRC) common/dpumesh.c common/dpumesh_handler.c
 
 all: tcp dpumesh
 

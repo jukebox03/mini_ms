@@ -102,8 +102,8 @@ void dpumesh_destroy(dpumesh_ctx_t *ctx);
 /* ====== Event Loop Integration ====== */
 
 /*
- * Returns a timerfd that fires periodically.
- * Register with epoll; when readable, call dpumesh_poll().
+ * Returns a notify fd (pipe read end) signaled by the internal poller thread.
+ * Register with epoll/libevent; when readable, call dpumesh_poll().
  */
 int dpumesh_get_notify_fd(dpumesh_ctx_t *ctx);
 

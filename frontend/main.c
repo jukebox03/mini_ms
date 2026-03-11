@@ -109,7 +109,7 @@ int main(void) {
     printf("[frontend] id_service=%s:%d attend_service=%s:%d\n",
            id_host, id_port, attend_host, attend_port);
 
-    g_upstream_handler = handle_upstream_response;
+    tcp_handler_set_upstream(handle_upstream_response);
 
     int port = 8080;
     if ((env = getenv("PORT"))) port = atoi(env);

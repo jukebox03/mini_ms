@@ -290,6 +290,10 @@ void tcp_listen_start(struct event_base *base, int listen_fd,
     event_add(ev, NULL);
 }
 
+void tcp_handler_set_upstream(upstream_handler_fn handler) {
+    g_upstream_handler = handler;
+}
+
 void epoll_run(int listen_fd, request_handler_fn handler) {
     struct event_base *base = event_base_new();
     tcp_listen_start(base, listen_fd, handler);
