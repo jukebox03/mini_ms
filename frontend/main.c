@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 #include "json_util.h"
 #include "http_parse.h"
 #include "tcp_handler.h"
@@ -118,5 +119,6 @@ int main(void) {
     if (fd < 0) return 1;
 
     epoll_run(fd, handle_request);
+    close(fd);
     return 0;
 }
