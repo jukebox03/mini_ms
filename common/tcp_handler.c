@@ -12,6 +12,8 @@
 #include <netdb.h>
 #include <sys/socket.h>
 
+/* ====== Internal state ====== */
+
 request_handler_fn  g_request_handler = NULL;
 upstream_handler_fn g_upstream_handler = NULL;
 
@@ -20,6 +22,8 @@ static int set_nonblocking(int fd) {
     if (flags < 0) return -1;
     return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 }
+
+/* ====== Connection alloc/free ====== */
 
 conn_t *conn_alloc(int fd, struct event_base *base) {
     conn_t *c = calloc(1, sizeof(conn_t));
@@ -66,7 +70,7 @@ static void on_upstream_connect_cb(evutil_socket_t fd, short what, void *arg);
 static void on_upstream_write_cb(evutil_socket_t fd, short what, void *arg);
 static void on_upstream_read_cb(evutil_socket_t fd, short what, void *arg);
 
-/* ====== Accept ====== */
+/* ====== Inbound: listen_fd readable → accept → read → request handler ====== */
 
 static void on_accept_cb(evutil_socket_t fd, short what, void *arg) {
     (void)what;
@@ -93,8 +97,6 @@ static void on_accept_cb(evutil_socket_t fd, short what, void *arg) {
     }
 }
 
-/* ====== Client read/write ====== */
-
 static void on_client_read_cb(evutil_socket_t fd, short what, void *arg) {
     (void)what;
     conn_t *c = arg;
@@ -118,6 +120,8 @@ static void on_client_read_cb(evutil_socket_t fd, short what, void *arg) {
     if (g_request_handler)
         g_request_handler(c, &req);
 }
+
+/* ====== Per-request: respond ====== */
 
 void conn_start_response(conn_t *c, int status, const char *body, size_t body_len) {
     c->wlen = http_format_response(c->wbuf, sizeof(c->wbuf), status, body, body_len);
@@ -144,7 +148,7 @@ static void on_client_write_cb(evutil_socket_t fd, short what, void *arg) {
     }
 }
 
-/* ====== Upstream ====== */
+/* ====== Per-request: upstream ====== */
 
 int conn_start_upstream(conn_t *client, const char *host, int port,
                         const char *method, const char *path,

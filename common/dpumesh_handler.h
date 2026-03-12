@@ -7,11 +7,7 @@
 
 typedef struct dpu_conn {
     conn_t   base;
-    char     dpu_req_id_str[64];
-    char     dpu_source_worker[128];
-    int      dpu_case_flag;
-    uint32_t dpu_req_id;
-    int      dpu_is_response;
+    int      dpu_desc_index;
 } dpu_conn_t;
 
 /*

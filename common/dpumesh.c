@@ -443,8 +443,9 @@ struct dpumesh_ctx {
     int         notify_write_fd;    /* pipe write end — used by poller thread */
     pthread_t   poller_tid;
     volatile int poller_running;
-    volatile int notified;          /* prevent redundant pipe writes */
     uint32_t    next_req_id;
+    int         response_pipe_fds[DPUMESH_MAX_PENDING];  /* write-end, index = req_id % MAX */
+    dpumesh_inbound_t inbound[DPUMESH_MAX_PENDING];     /* routing metadata, index = req_id % MAX */
 
     /* Host buffer pools (per-service, shared) */
     buffer_pool_t tx_header;
@@ -467,23 +468,31 @@ static void *dpumesh_poller_fn(void *arg) {
     int idle_count = 0;
 
     while (ctx->poller_running) {
-        /* Peek at rx_sq count (relaxed read — just a hint) */
-        uint32_t *hdr = (uint32_t *)ctx->rx_sq.mm;
-        uint32_t count = hdr[2];
-
-        if (count > 0 && !ctx->notified) {
-            ctx->notified = 1;
-            char b = 1;
-            if (write(ctx->notify_write_fd, &b, 1) < 0) { /* ignore */ }
+        sw_descriptor_t desc;
+        if (dr_get(&ctx->rx_sq, &desc) == 0) {
+            if (desc.valid != 1) continue;
             idle_count = 0;
-        } else if (count == 0) {
-            idle_count++;
-            if (idle_count > 10000) {
-                usleep(1000);           /* 1ms — deep idle */
-            } else if (idle_count > 100) {
-                usleep(100);            /* 100us — light idle */
+
+            int is_response = (desc.flags & 0xF0) == OP_RESPONSE;
+            if (is_response) {
+                /* per-request pipe: send descriptor to waiting caller */
+                int idx = desc.req_id % DPUMESH_MAX_PENDING;
+                int wfd = ctx->response_pipe_fds[idx];
+                if (wfd >= 0) {
+                    write(wfd, &desc, sizeof(desc));
+                    close(wfd);
+                    ctx->response_pipe_fds[idx] = -1;
+                }
+            } else {
+                /* main notify pipe: send descriptor for request handling */
+                write(ctx->notify_write_fd, &desc, sizeof(desc));
             }
-            /* else: busy poll */
+        } else {
+            idle_count++;
+            if (idle_count > 10000)
+                usleep(1000);
+            else if (idle_count > 100)
+                usleep(100);
         }
     }
 
@@ -545,8 +554,8 @@ int dpumesh_init(dpumesh_ctx_t **out, const char *app_name, int worker_num) {
 
     ctx->notify_fd = pfd[0];
     ctx->notify_write_fd = pfd[1];
-    ctx->notified = 0;
     ctx->poller_running = 1;
+    memset(ctx->response_pipe_fds, -1, sizeof(ctx->response_pipe_fds));
 
     if (pthread_create(&ctx->poller_tid, NULL, dpumesh_poller_fn, ctx) != 0)
         goto fail;
@@ -568,6 +577,10 @@ void dpumesh_destroy(dpumesh_ctx_t *ctx) {
     pthread_join(ctx->poller_tid, NULL);
     if (ctx->notify_fd >= 0) close(ctx->notify_fd);
     if (ctx->notify_write_fd >= 0) close(ctx->notify_write_fd);
+    for (int i = 0; i < DPUMESH_MAX_PENDING; i++) {
+        if (ctx->response_pipe_fds[i] >= 0)
+            close(ctx->response_pipe_fds[i]);
+    }
     bp_destroy(&ctx->tx_header);
     bp_destroy(&ctx->tx_body);
     bp_destroy(&ctx->rx_header);
@@ -589,195 +602,245 @@ const char *dpumesh_get_worker_id(dpumesh_ctx_t *ctx) {
     return ctx->worker_id;
 }
 
-int dpumesh_poll(dpumesh_ctx_t *ctx,
-                 dpumesh_on_response_fn on_resp, void *resp_data,
-                 dpumesh_on_request_fn  on_req,  void *req_data) {
-    /* Drain notify pipe and allow poller to signal again */
-    char drain_buf[64];
-    while (read(ctx->notify_fd, drain_buf, sizeof(drain_buf)) > 0) {}
-    ctx->notified = 0;
-
+int dpumesh_read(dpumesh_ctx_t *ctx,
+                 dpumesh_on_request_fn on_req, void *req_data) {
     int count = 0;
     sw_descriptor_t desc;
 
-    while (dr_get(&ctx->rx_sq, &desc) == 0) {
+    /* Read descriptors from notify pipe (poller puts request descriptors here) */
+    while (read(ctx->notify_fd, &desc, sizeof(desc)) == (ssize_t)sizeof(desc)) {
         if (desc.valid != 1) continue;
         count++;
 
-        int is_response = (desc.flags & 0xF0) == OP_RESPONSE;
         int case_flag = desc.flags & 0x0F;
 
-        if (is_response && on_resp) {
-            /* Read response header + body */
-            dpumesh_response_t resp;
-            memset(&resp, 0, sizeof(resp));
-            resp._header_slot = desc.header_buf_slot;
-            resp._body_slot = desc.body_buf_slot;
+        /* Incoming request */
+        dpumesh_request_t req;
+        memset(&req, 0, sizeof(req));
+        req.req_id = desc.req_id;
+        req.src_pod_id = desc.src_pod_id;
+        req._header_slot = desc.header_buf_slot;
+        req._body_slot = desc.body_buf_slot;
+        req._case_flag = case_flag;
 
-            /* Read header (from RX header pool) */
-            if (desc.header_buf_slot >= 0 && desc.header_len > 0) {
-                char hbuf[4096];
-                int hlen = bp_read(&ctx->rx_header, desc.header_buf_slot, hbuf,
-                                   desc.header_len < sizeof(hbuf) ? desc.header_len : sizeof(hbuf) - 1);
-                hbuf[hlen] = '\0';
-                resp.status_code = json_get_int(hbuf, "status_code");
-                json_get_str(hbuf, "req_id_str", resp.req_id_str, sizeof(resp.req_id_str));
-                json_get_str(hbuf, "source_worker", resp.source_worker, sizeof(resp.source_worker));
-            }
+        /* Store routing metadata in inbound table */
+        int idx = desc.req_id % DPUMESH_MAX_PENDING;
+        req._desc_index = idx;
 
-            /* Read body (from RX body pool) */
-            static char body_buf[DPUMESH_SLOT_SIZE];
+        static char req_hdr_buf[4096];
+        static char req_body_buf[DPUMESH_SLOT_SIZE];
+        static char method_buf[16];
+        static char path_buf[256];
+        static char qs_buf[512];
+
+        if (case_flag == CASE_INGRESS) {
+            /* Case 2: combined header+body in body buffer */
             if (desc.body_buf_slot >= 0 && desc.body_len > 0) {
-                int blen = bp_read(&ctx->rx_body, desc.body_buf_slot, body_buf,
-                                   desc.body_len < sizeof(body_buf) ? desc.body_len : sizeof(body_buf) - 1);
-                body_buf[blen] = '\0';
-                resp.body = body_buf;
-                resp.body_len = blen;
+                char combined[DPUMESH_SLOT_SIZE];
+                int clen = bp_read(&ctx->rx_body, desc.body_buf_slot, combined,
+                                   desc.body_len < sizeof(combined) ? desc.body_len : sizeof(combined) - 1);
+                combined[clen] = '\0';
+
+                char header_json[4096];
+                parse_case2_body(combined, clen, header_json, sizeof(header_json),
+                                 req_body_buf, sizeof(req_body_buf));
+
+                json_get_str(header_json, "method", method_buf, sizeof(method_buf));
+                json_get_str(header_json, "path", path_buf, sizeof(path_buf));
+                json_get_str(header_json, "query_string", qs_buf, sizeof(qs_buf));
+                json_get_str(header_json, "req_id_str", req.req_id_str, sizeof(req.req_id_str));
+                json_get_str(header_json, "source_worker", req.source_worker, sizeof(req.source_worker));
+                json_get_str(header_json, "dest_worker", req.dest_worker, sizeof(req.dest_worker));
+
+                req.method = method_buf;
+                req.path = path_buf;
+                req.query_string = qs_buf;
+                req.body = req_body_buf;
+                req.body_len = strlen(req_body_buf);
             }
+        } else {
+            /* Case 3: header in rx_header, body in rx_body */
+            if (desc.header_buf_slot >= 0 && desc.header_len > 0) {
+                int hlen = bp_read(&ctx->rx_header, desc.header_buf_slot, req_hdr_buf,
+                                   desc.header_len < sizeof(req_hdr_buf) ? desc.header_len : sizeof(req_hdr_buf) - 1);
+                req_hdr_buf[hlen] = '\0';
 
-            on_resp(desc.req_id, &resp, resp_data);
+                json_get_str(req_hdr_buf, "method", method_buf, sizeof(method_buf));
+                json_get_str(req_hdr_buf, "path", path_buf, sizeof(path_buf));
+                json_get_str(req_hdr_buf, "query_string", qs_buf, sizeof(qs_buf));
+                json_get_str(req_hdr_buf, "req_id_str", req.req_id_str, sizeof(req.req_id_str));
+                json_get_str(req_hdr_buf, "source_worker", req.source_worker, sizeof(req.source_worker));
+                json_get_str(req_hdr_buf, "dest_worker", req.dest_worker, sizeof(req.dest_worker));
 
-            /* Free RX buffers */
-            if (desc.header_buf_slot >= 0)
-                bp_free(&ctx->rx_header, desc.header_buf_slot);
-            if (desc.body_buf_slot >= 0)
-                bp_free(&ctx->rx_body, desc.body_buf_slot);
-
-        } else if (!is_response && on_req) {
-            /* Incoming request */
-            dpumesh_request_t req;
-            memset(&req, 0, sizeof(req));
-            req.req_id = desc.req_id;
-            req.src_pod_id = desc.src_pod_id;
-            req._header_slot = desc.header_buf_slot;
-            req._body_slot = desc.body_buf_slot;
-            req._case_flag = case_flag;
-
-            static char req_hdr_buf[4096];
-            static char req_body_buf[DPUMESH_SLOT_SIZE];
-            static char method_buf[16];
-            static char path_buf[256];
-            static char qs_buf[512];
-
-            if (case_flag == CASE_INGRESS) {
-                /* Case 2: combined header+body in body buffer */
-                if (desc.body_buf_slot >= 0 && desc.body_len > 0) {
-                    char combined[DPUMESH_SLOT_SIZE];
-                    int clen = bp_read(&ctx->rx_body, desc.body_buf_slot, combined,
-                                       desc.body_len < sizeof(combined) ? desc.body_len : sizeof(combined) - 1);
-                    combined[clen] = '\0';
-
-                    char header_json[4096];
-                    parse_case2_body(combined, clen, header_json, sizeof(header_json),
-                                     req_body_buf, sizeof(req_body_buf));
-
-                    json_get_str(header_json, "method", method_buf, sizeof(method_buf));
-                    json_get_str(header_json, "path", path_buf, sizeof(path_buf));
-                    json_get_str(header_json, "query_string", qs_buf, sizeof(qs_buf));
-                    json_get_str(header_json, "req_id_str", req.req_id_str, sizeof(req.req_id_str));
-                    json_get_str(header_json, "source_worker", req.source_worker, sizeof(req.source_worker));
-                    json_get_str(header_json, "dest_worker", req.dest_worker, sizeof(req.dest_worker));
-
-                    req.method = method_buf;
-                    req.path = path_buf;
-                    req.query_string = qs_buf;
-                    req.body = req_body_buf;
-                    req.body_len = strlen(req_body_buf);
-                }
-            } else {
-                /* Case 3: header in rx_header, body in rx_body */
-                if (desc.header_buf_slot >= 0 && desc.header_len > 0) {
-                    int hlen = bp_read(&ctx->rx_header, desc.header_buf_slot, req_hdr_buf,
-                                       desc.header_len < sizeof(req_hdr_buf) ? desc.header_len : sizeof(req_hdr_buf) - 1);
-                    req_hdr_buf[hlen] = '\0';
-
-                    json_get_str(req_hdr_buf, "method", method_buf, sizeof(method_buf));
-                    json_get_str(req_hdr_buf, "path", path_buf, sizeof(path_buf));
-                    json_get_str(req_hdr_buf, "query_string", qs_buf, sizeof(qs_buf));
-                    json_get_str(req_hdr_buf, "req_id_str", req.req_id_str, sizeof(req.req_id_str));
-                    json_get_str(req_hdr_buf, "source_worker", req.source_worker, sizeof(req.source_worker));
-                    json_get_str(req_hdr_buf, "dest_worker", req.dest_worker, sizeof(req.dest_worker));
-
-                    req.method = method_buf;
-                    req.path = path_buf;
-                    req.query_string = qs_buf;
-                }
-                if (desc.body_buf_slot >= 0 && desc.body_len > 0) {
-                    int blen = bp_read(&ctx->rx_body, desc.body_buf_slot, req_body_buf,
-                                       desc.body_len < sizeof(req_body_buf) ? desc.body_len : sizeof(req_body_buf) - 1);
-                    req_body_buf[blen] = '\0';
-                    req.body = req_body_buf;
-                    req.body_len = blen;
-                }
+                req.method = method_buf;
+                req.path = path_buf;
+                req.query_string = qs_buf;
             }
-
-            on_req(&req, req_data);
-
-            /* Free RX buffers */
-            if (desc.header_buf_slot >= 0)
-                bp_free(&ctx->rx_header, desc.header_buf_slot);
-            if (desc.body_buf_slot >= 0)
-                bp_free(&ctx->rx_body, desc.body_buf_slot);
+            if (desc.body_buf_slot >= 0 && desc.body_len > 0) {
+                int blen = bp_read(&ctx->rx_body, desc.body_buf_slot, req_body_buf,
+                                   desc.body_len < sizeof(req_body_buf) ? desc.body_len : sizeof(req_body_buf) - 1);
+                req_body_buf[blen] = '\0';
+                req.body = req_body_buf;
+                req.body_len = blen;
+            }
         }
+
+        /* Store routing metadata in inbound table for dpumesh_write() RESPONSE */
+        ctx->inbound[idx].req_id = req.req_id;
+        snprintf(ctx->inbound[idx].req_id_str, sizeof(ctx->inbound[idx].req_id_str),
+                 "%s", req.req_id_str);
+        snprintf(ctx->inbound[idx].source_worker, sizeof(ctx->inbound[idx].source_worker),
+                 "%s", req.source_worker);
+        ctx->inbound[idx].case_flag = case_flag;
+        ctx->inbound[idx].active = 1;
+
+        if (on_req) on_req(&req, req_data);
+
+        /* Free RX buffers */
+        if (desc.header_buf_slot >= 0)
+            bp_free(&ctx->rx_header, desc.header_buf_slot);
+        if (desc.body_buf_slot >= 0)
+            bp_free(&ctx->rx_body, desc.body_buf_slot);
     }
     return count;
 }
 
-dpumesh_req_id dpumesh_send(dpumesh_ctx_t *ctx,
-                            const char *method,
-                            const char *url,
-                            const char *headers_json,
-                            const void *body,
-                            size_t body_len) {
-    (void)headers_json;
+int dpumesh_read_response(dpumesh_ctx_t *ctx, int response_fd,
+                          dpumesh_response_t *out_resp) {
+    sw_descriptor_t desc;
+    if (read(response_fd, &desc, sizeof(desc)) != (ssize_t)sizeof(desc))
+        return -1;
+    close(response_fd);
 
-    uint32_t req_id = ctx->next_req_id++;
+    memset(out_resp, 0, sizeof(*out_resp));
+    out_resp->_header_slot = desc.header_buf_slot;
+    out_resp->_body_slot = desc.body_buf_slot;
+
+    /* Read header from RX header pool */
+    if (desc.header_buf_slot >= 0 && desc.header_len > 0) {
+        static char hbuf[4096];
+        int hlen = bp_read(&ctx->rx_header, desc.header_buf_slot, hbuf,
+                           desc.header_len < sizeof(hbuf) ? desc.header_len : sizeof(hbuf) - 1);
+        hbuf[hlen] = '\0';
+        out_resp->status_code = json_get_int(hbuf, "status_code");
+        json_get_str(hbuf, "req_id_str", out_resp->req_id_str, sizeof(out_resp->req_id_str));
+        json_get_str(hbuf, "source_worker", out_resp->source_worker, sizeof(out_resp->source_worker));
+    }
+
+    /* Read body from RX body pool */
+    static char body_buf[DPUMESH_SLOT_SIZE];
+    if (desc.body_buf_slot >= 0 && desc.body_len > 0) {
+        int blen = bp_read(&ctx->rx_body, desc.body_buf_slot, body_buf,
+                           desc.body_len < sizeof(body_buf) ? desc.body_len : sizeof(body_buf) - 1);
+        body_buf[blen] = '\0';
+        out_resp->body = body_buf;
+        out_resp->body_len = blen;
+    }
+
+    /* Free RX buffers */
+    if (desc.header_buf_slot >= 0)
+        bp_free(&ctx->rx_header, desc.header_buf_slot);
+    if (desc.body_buf_slot >= 0)
+        bp_free(&ctx->rx_body, desc.body_buf_slot);
+
+    return 0;
+}
+
+int dpumesh_write(dpumesh_ctx_t *ctx, const dpumesh_msg_t *msg,
+                  dpumesh_req_id *out_req_id, int *out_response_fd) {
     int header_slot = -1, body_slot = -1;
+    uint32_t req_id;
+    int8_t flags;
+    const void *body = msg->body;
+    size_t body_len = msg->body_len;
 
-    /* Parse URL for path and query */
-    const char *path = "/";
-    const char *query = "";
-    const char *path_start = strstr(url, "://");
-    if (path_start) {
-        path_start += 3;
-        path_start = strchr(path_start, '/');
-        if (path_start) path = path_start;
-    }
-    char path_buf[256], query_buf[512];
-    const char *qmark = strchr(path, '?');
-    if (qmark) {
-        size_t plen = qmark - path;
-        if (plen >= sizeof(path_buf)) plen = sizeof(path_buf) - 1;
-        memcpy(path_buf, path, plen);
-        path_buf[plen] = '\0';
-        snprintf(query_buf, sizeof(query_buf), "%s", qmark + 1);
-        path = path_buf;
-        query = query_buf;
-    }
-
-    char req_id_str[32];
-    snprintf(req_id_str, sizeof(req_id_str), "creq-%u", req_id);
-
-    /* Write header to TX header buffer */
     char hdr_data[4096];
-    int hdr_len = serialize_header(hdr_data, sizeof(hdr_data),
-                                   method, url, path, query,
+    int hdr_len;
+
+    if (msg->type == DPUMESH_MSG_REQUEST) {
+        /* === REQUEST path (was dpumesh_send) === */
+        req_id = ctx->next_req_id++;
+
+        /* Parse URL for path and query */
+        const char *url = msg->url ? msg->url : "";
+        const char *path = "/";
+        const char *query = "";
+        const char *path_start = strstr(url, "://");
+        if (path_start) {
+            path_start += 3;
+            path_start = strchr(path_start, '/');
+            if (path_start) path = path_start;
+        }
+        char path_buf[256], query_buf[512];
+        const char *qmark = strchr(path, '?');
+        if (qmark) {
+            size_t plen = qmark - path;
+            if (plen >= sizeof(path_buf)) plen = sizeof(path_buf) - 1;
+            memcpy(path_buf, path, plen);
+            path_buf[plen] = '\0';
+            snprintf(query_buf, sizeof(query_buf), "%s", qmark + 1);
+            path = path_buf;
+            query = query_buf;
+        }
+
+        char req_id_str[32];
+        snprintf(req_id_str, sizeof(req_id_str), "creq-%u", req_id);
+
+        hdr_len = serialize_header(hdr_data, sizeof(hdr_data),
+                                   msg->method, url, path, query,
                                    0, req_id_str,
                                    ctx->worker_id, "");
+        flags = OP_REQUEST | CASE_LOCAL;
 
+        if (out_req_id) *out_req_id = req_id;
+
+        /* Create per-request pipe for response delivery */
+        if (out_response_fd) {
+            int rpfd[2];
+            if (pipe(rpfd) < 0) return -1;
+            int fl = fcntl(rpfd[0], F_GETFL, 0);
+            fcntl(rpfd[0], F_SETFL, fl | O_NONBLOCK);
+
+            int idx = req_id % DPUMESH_MAX_PENDING;
+            ctx->response_pipe_fds[idx] = rpfd[1];  /* write-end for poller */
+            *out_response_fd = rpfd[0];              /* read-end for caller */
+        }
+
+    } else {
+        /* === RESPONSE path (was dpumesh_respond) === */
+        const dpumesh_request_t *orig = msg->orig_req;
+        int didx = orig->_desc_index;
+        dpumesh_inbound_t *ib = &ctx->inbound[didx];
+        req_id = ib->req_id;
+
+        const char *dest_worker = ib->source_worker;
+        int case_flag = CASE_INGRESS;  /* default: back to bridge */
+        if (dest_worker[0] != '\0') {
+            case_flag = CASE_LOCAL;  /* back to another worker */
+        }
+
+        hdr_len = serialize_header(hdr_data, sizeof(hdr_data),
+                                   "", "", "", "",
+                                   msg->status_code, ib->req_id_str,
+                                   ctx->worker_id, dest_worker);
+        flags = OP_RESPONSE | case_flag;
+
+        /* Release inbound slot */
+        ib->active = 0;
+    }
+
+    /* === Common: alloc TX buffers, build descriptor, enqueue === */
     header_slot = bp_alloc(&ctx->tx_header);
-    if (header_slot < 0) return 0;
+    if (header_slot < 0) return -1;
     bp_write(&ctx->tx_header, header_slot, hdr_data, hdr_len);
 
-    /* Write body to TX body buffer */
     body_slot = bp_alloc(&ctx->tx_body);
-    if (body_slot < 0) { bp_free(&ctx->tx_header, header_slot); return 0; }
+    if (body_slot < 0) { bp_free(&ctx->tx_header, header_slot); return -1; }
     if (body && body_len > 0)
         bp_write(&ctx->tx_body, body_slot, body, body_len);
     else
         bp_write(&ctx->tx_body, body_slot, "", 1);
 
-    /* Build descriptor */
     sw_descriptor_t desc;
     memset(&desc, 0, sizeof(desc));
     desc.header_buf_slot = header_slot;
@@ -788,69 +851,7 @@ dpumesh_req_id dpumesh_send(dpumesh_ctx_t *ctx,
     desc.step_id = 0;
     desc.dst_pod_id = 0;
     desc.src_pod_id = ctx->pod_id;
-    desc.flags = OP_REQUEST | CASE_LOCAL;
-    desc.valid = 1;
-    desc.src_header_pool_type = POOL_HOST_TX_HEADER;
-    desc.src_header_pod_id = ctx->pod_id;
-    desc.src_header_buf_slot = header_slot;
-    desc.src_body_pool_type = POOL_HOST_TX_BODY;
-    desc.src_body_pod_id = ctx->pod_id;
-    desc.src_body_buf_slot = body_slot;
-
-    if (dr_put(&ctx->tx_sq, &desc) < 0) {
-        bp_free(&ctx->tx_header, header_slot);
-        bp_free(&ctx->tx_body, body_slot);
-        return 0;
-    }
-
-    return req_id;
-}
-
-int dpumesh_respond(dpumesh_ctx_t *ctx,
-                    const dpumesh_request_t *req,
-                    int status_code,
-                    const char *body,
-                    size_t body_len) {
-    int header_slot = -1, body_slot = -1;
-
-    /* Determine destination */
-    const char *dest_worker = req->source_worker;
-    int case_flag = CASE_INGRESS;  /* default: back to bridge */
-    if (dest_worker[0] != '\0') {
-        case_flag = CASE_LOCAL;  /* back to another worker */
-    }
-
-    /* Write header */
-    char hdr_data[4096];
-    int hdr_len = serialize_header(hdr_data, sizeof(hdr_data),
-                                   "", "", "", "",
-                                   status_code, req->req_id_str,
-                                   ctx->worker_id, dest_worker);
-
-    header_slot = bp_alloc(&ctx->tx_header);
-    if (header_slot < 0) return -1;
-    bp_write(&ctx->tx_header, header_slot, hdr_data, hdr_len);
-
-    /* Write body */
-    body_slot = bp_alloc(&ctx->tx_body);
-    if (body_slot < 0) { bp_free(&ctx->tx_header, header_slot); return -1; }
-    if (body && body_len > 0)
-        bp_write(&ctx->tx_body, body_slot, body, body_len);
-    else
-        bp_write(&ctx->tx_body, body_slot, "", 1);
-
-    /* Build descriptor */
-    sw_descriptor_t desc;
-    memset(&desc, 0, sizeof(desc));
-    desc.header_buf_slot = header_slot;
-    desc.header_len = hdr_len;
-    desc.body_buf_slot = body_slot;
-    desc.body_len = (body && body_len > 0) ? body_len : 1;
-    desc.req_id = req->req_id;
-    desc.step_id = 0;
-    desc.dst_pod_id = 0;
-    desc.src_pod_id = ctx->pod_id;
-    desc.flags = OP_RESPONSE | case_flag;
+    desc.flags = flags;
     desc.valid = 1;
     desc.src_header_pool_type = POOL_HOST_TX_HEADER;
     desc.src_header_pod_id = ctx->pod_id;

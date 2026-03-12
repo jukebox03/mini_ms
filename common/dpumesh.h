@@ -86,7 +86,31 @@ typedef struct {
     int         _header_slot;
     int         _body_slot;
     int         _case_flag;
+    int         _desc_index;
 } dpumesh_request_t;
+
+/* Inbound routing metadata (stored in library, indexed by _desc_index) */
+typedef struct {
+    uint32_t req_id;
+    char     req_id_str[64];
+    char     source_worker[128];
+    int      case_flag;
+    int      active;
+} dpumesh_inbound_t;
+
+/* ====== Write Message Type ====== */
+#define DPUMESH_MSG_REQUEST   0
+#define DPUMESH_MSG_RESPONSE  1
+
+typedef struct {
+    int          type;           /* DPUMESH_MSG_REQUEST or DPUMESH_MSG_RESPONSE */
+    const char  *method;         /* request only */
+    const char  *url;            /* request only */
+    int          status_code;    /* response only */
+    const dpumesh_request_t *orig_req;  /* response only (req_id, source_worker, case_flag) */
+    const void  *body;
+    size_t       body_len;
+} dpumesh_msg_t;
 
 /* Callbacks */
 typedef void (*dpumesh_on_response_fn)(dpumesh_req_id req_id,
@@ -108,35 +132,33 @@ void dpumesh_destroy(dpumesh_ctx_t *ctx);
 int dpumesh_get_notify_fd(dpumesh_ctx_t *ctx);
 
 /*
- * Check RX SQ and invoke callbacks.
+ * Read requests from notify pipe (responses go to per-request fds).
  * Returns number of descriptors processed.
  */
-int dpumesh_poll(dpumesh_ctx_t *ctx,
-                 dpumesh_on_response_fn on_resp, void *resp_data,
-                 dpumesh_on_request_fn  on_req,  void *req_data);
-
-/* ====== Non-blocking Send ====== */
+int dpumesh_read(dpumesh_ctx_t *ctx,
+                 dpumesh_on_request_fn on_req, void *req_data);
 
 /*
- * Send request to another service via SHM.
- * url format: "http://service_name/path?query"
- * Returns req_id > 0 on success, 0 on failure.
+ * Read a single response from a per-request fd.
+ * response_fd is closed internally.
+ * Returns 0 on success, -1 on failure.
  */
-dpumesh_req_id dpumesh_send(dpumesh_ctx_t *ctx,
-                            const char *method,
-                            const char *url,
-                            const char *headers_json,
-                            const void *body,
-                            size_t body_len);
+int dpumesh_read_response(dpumesh_ctx_t *ctx, int response_fd,
+                          dpumesh_response_t *out_resp);
+
+/* ====== Non-blocking Write ====== */
 
 /*
- * Send response to an ingress request.
+ * Write a request or response to SHM.
+ * msg->type determines behavior:
+ *   DPUMESH_MSG_REQUEST:  sends to upstream service, sets *out_req_id,
+ *                         creates per-request pipe, returns read-end in *out_response_fd
+ *   DPUMESH_MSG_RESPONSE: sends response back using msg->orig_req metadata
+ *                         (out_response_fd ignored, pass NULL)
+ * Returns 0 on success, -1 on failure.
  */
-int dpumesh_respond(dpumesh_ctx_t *ctx,
-                    const dpumesh_request_t *req,
-                    int status_code,
-                    const char *body,
-                    size_t body_len);
+int dpumesh_write(dpumesh_ctx_t *ctx, const dpumesh_msg_t *msg,
+                  dpumesh_req_id *out_req_id, int *out_response_fd);
 
 /* ====== Buffer Management ====== */
 void dpumesh_request_free(dpumesh_ctx_t *ctx, const dpumesh_request_t *req);

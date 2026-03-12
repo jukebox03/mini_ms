@@ -21,8 +21,8 @@ TCP와 DPUmesh 모두 libevent의 `event_base`를 공유하며, 핸들러는 동
 | 파일 | 역할 |
 |------|------|
 | `common/tcp_handler.h/c` | libevent 기반 TCP 핸들러 (accept, read, write, upstream) |
-| `common/dpumesh_handler.h/c` | libevent 기반 DPUmesh 핸들러 (notify fd + callback) |
-| `common/dpumesh.h/c` | DPUmesh 라이브러리 (SHM 통신, poller thread, notify fd) |
+| `common/dpumesh_handler.h/c` | libevent 기반 DPUmesh 핸들러 (per-request fd + callback) |
+| `common/dpumesh.h/c` | DPUmesh 라이브러리 (SHM 통신, poller thread, per-request pipe) |
 | `common/http_parse.h/c` | HTTP/1.1 파서 |
 | `common/json_util.h/c` | JSON 로더 + query string 파서 |
 | `dpumesh/common.py` | SHM 레이아웃 정의 (Python 데몬과 공유) |
@@ -56,9 +56,9 @@ make all      # 둘 다
 |------|----------------|--------------------------|
 | 초기화 | `socket()` + `bind()` + `listen()` | `dpumesh_init(&ctx, app, worker_id)` |
 | notify fd 획득 | listen fd (socket 자체) | `dpumesh_get_notify_fd(ctx)` |
-| 데이터 수신 | `read(fd, buf, len)` | `dpumesh_poll(ctx, on_resp, .., on_req, ..)` |
-| 데이터 송신 | `write(fd, buf, len)` | `dpumesh_send(ctx, method, url, ..)` |
-| 응답 송신 | `write(fd, buf, len)` | `dpumesh_respond(ctx, req, status, body, len)` |
+| 요청 수신 | `read(fd, buf, len)` | `dpumesh_read(ctx, on_req, ..)` (notify fd에서 descriptor 읽기) |
+| 응답 수신 | `read(fd, buf, len)` | `dpumesh_read_response(ctx, response_fd, &resp)` (per-request fd) |
+| 데이터 송신 | `write(fd, buf, len)` | `dpumesh_write(ctx, &msg, &req_id, &response_fd)` (REQUEST 시 per-request response_fd 반환) |
 | 정리 | `close(fd)` | `dpumesh_destroy(ctx)` |
 | 알림 메커니즘 | kernel이 fd를 readable로 전환 | 내부 poller thread가 pipe fd에 signal |
 
@@ -66,7 +66,7 @@ make all      # 둘 다
 
 ```c
 // TCP:  listen_fd readable → 새 연결 도착
-// DPUmesh: notify_fd readable → SHM에 새 데이터 도착
+// DPUmesh: notify_fd readable → dpumesh_read()로 RX SQ 처리
 ```
 
 ### Layer 2: 핸들러 API (tcp_handler vs dpumesh_handler)
@@ -147,10 +147,12 @@ struct dpumesh_ctx {
     char        app_name[64];       // 서비스 이름 ("frontend")
     char        worker_id[128];     // 워커 식별자 ("frontend-worker-0")
     int         pod_id;             // PodRegistry에서 할당받은 고유 ID
-    int         notify_fd;          // pipe read end (event loop에 등록)
-    int         notify_write_fd;    // pipe write end (poller thread가 signal)
+    int         notify_fd;          // pipe read end (event loop에 등록, request descriptor 수신)
+    int         notify_write_fd;    // pipe write end (poller thread가 request descriptor 전달)
     pthread_t   poller_tid;         // SHM polling thread
     uint32_t    next_req_id;        // 요청 ID 카운터
+    int         response_pipe_fds[MAX_PENDING]; // per-request pipe write-end (poller가 response descriptor 전달)
+    dpumesh_inbound_t inbound[MAX_PENDING];    // 인바운드 라우팅 메타데이터 (req_id, source_worker 등)
 
     buffer_pool_t tx_header, tx_body;   // 송신 버퍼 풀 (SHM mmap)
     buffer_pool_t rx_header, rx_body;   // 수신 버퍼 풀 (SHM mmap)

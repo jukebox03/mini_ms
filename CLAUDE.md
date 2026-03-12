@@ -38,16 +38,16 @@ Layer 0:  Data path           TCP socket            |  SHM (common/dpumesh.c)
 ```
 
 - TCP and DPUmesh share the same `event_base` and `conn_t` abstraction.
-- Each service has two entry points: `main.c` (TCP) and `main_dpumesh.c` (DPUmesh). Business logic (request/upstream handlers) is identical; only init and send/respond calls differ.
-- DPUmesh handler wraps low-level SHM into libevent via a poller thread + pipe notification, so handlers receive the same `conn_t *`.
+- Each service has two entry points: `main.c` (TCP) and `main_dpumesh.c` (DPUmesh). Business logic (request/upstream handlers) is identical; only init and read/write calls differ.
+- DPUmesh handler wraps low-level SHM into libevent via per-request pipe fds (responses) and a main notify pipe (requests), so handlers receive the same `conn_t *`. Upstream response delivery uses the same fd+libevent pattern as TCP.
 
 ## Key Files
 
 | File | Role |
 |------|------|
 | `common/tcp_handler.h/c` | libevent TCP handler: accept, read, write, upstream relay |
-| `common/dpumesh_handler.h/c` | DPUmesh→libevent bridge (poller thread + pipe) |
-| `common/dpumesh.h/c` | Low-level SHM API (BufferPool, DescriptorRing, PodRegistry) |
+| `common/dpumesh_handler.h/c` | DPUmesh→libevent bridge (descriptor index pattern, per-request pipe fd + libevent) |
+| `common/dpumesh.h/c` | Low-level SHM API: `dpumesh_read`/`dpumesh_write`/`dpumesh_read_response` (BufferPool, DescriptorRing, PodRegistry, per-request pipe) |
 | `common/http_parse.h/c` | HTTP/1.1 request/response parser |
 | `common/json_util.h/c` | JSON file loader + query string parser |
 | `dpumesh/common.py` | SHM layout constants shared with C (`dpumesh.h` constants must match) |
@@ -71,7 +71,7 @@ dpumesh_run(dpu_ctx, handle_request);
 dpumesh_destroy(dpu_ctx);
 ```
 
-Response/upstream calls swap `conn_start_response(c, ...)` → `dpumesh_conn_respond(c, ...)` and `conn_start_upstream(c, ...)` → `dpumesh_conn_upstream(c, ...)`. Handler signatures stay the same. DPUmesh per-request calls no longer require `dpu_ctx` — the handler stores it internally.
+Response/upstream calls swap `conn_start_response(c, ...)` → `dpumesh_conn_respond(c, ...)` and `conn_start_upstream(c, ...)` → `dpumesh_conn_upstream(c, ...)`. Handler signatures stay the same. DPUmesh per-request calls no longer require `dpu_ctx` — the handler stores it internally. Routing metadata (req_id, source_worker, case_flag) lives in `ctx->inbound[]` inside the library; the handler only carries an opaque `dpu_desc_index`.
 
 ## Environment Variables
 

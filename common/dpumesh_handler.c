@@ -12,84 +12,48 @@ static struct event_base   *g_dpu_base = NULL;
 static request_handler_fn   g_dpu_request_handler = NULL;
 static upstream_handler_fn  g_dpu_upstream_handler = NULL;
 
-/* ====== Pending upstream map (single-threaded, no mutex needed) ====== */
-
-#define MAX_PENDING_UPSTREAM 256
-
-typedef struct {
-    uint32_t    req_id;
-    dpu_conn_t *conn;
-} pending_entry_t;
-
-static pending_entry_t g_pending[MAX_PENDING_UPSTREAM];
-
-static void pending_add(uint32_t req_id, dpu_conn_t *conn) {
-    for (int i = 0; i < MAX_PENDING_UPSTREAM; i++) {
-        if (g_pending[i].conn == NULL) {
-            g_pending[i].req_id = req_id;
-            g_pending[i].conn = conn;
-            return;
-        }
-    }
-}
-
-static dpu_conn_t *pending_remove(uint32_t req_id) {
-    for (int i = 0; i < MAX_PENDING_UPSTREAM; i++) {
-        if (g_pending[i].conn && g_pending[i].req_id == req_id) {
-            dpu_conn_t *result = g_pending[i].conn;
-            g_pending[i].conn = NULL;
-            g_pending[i].req_id = 0;
-            return result;
-        }
-    }
-    return NULL;
-}
-
-/* ====== dpu_conn_t alloc/free ====== */
+/* ====== Connection alloc/free ====== */
 
 static dpu_conn_t *dpu_conn_alloc(void) {
     dpu_conn_t *c = calloc(1, sizeof(dpu_conn_t));
     if (!c) return NULL;
-    c->base.fd = -1;    /* no real socket for dpumesh conns */
+    c->base.fd = -1;
     c->base.base = g_dpu_base;
     return c;
 }
 
 static void dpu_conn_free(dpu_conn_t *c) {
     if (!c) return;
+    if (c->base.ev) event_free(c->base.ev);
+    if (c->base.fd >= 0) close(c->base.fd);
     free(c);
 }
 
-/* ====== dpumesh_poll callbacks (main thread, no queue needed) ====== */
+/* Forward declarations
+ *
+ * TCP handler has 5 callbacks for the full lifecycle:
+ *   on_client_read_cb         — inbound request read
+ *   on_client_write_cb        — response write
+ *   on_upstream_connect_cb    — upstream TCP connect completion
+ *   on_upstream_write_cb      — upstream request write
+ *   on_upstream_read_cb       — upstream response read
+ *
+ * SHM eliminates network latency, so 3 of those collapse:
+ *   on_upstream_connect_cb    — not needed: SHM has no connection handshake
+ *   on_upstream_write_cb      — not needed: dpumesh_write() completes synchronously (memcpy)
+ *   on_client_write_cb        — not needed: dpumesh_conn_respond() completes synchronously
+ *
+ * What remains maps 1:1:
+ *   on_notify_cb              ↔ on_accept_cb + on_client_read_cb
+ *   on_upstream_response_cb   ↔ on_upstream_read_cb
+ *
+ * dpu_conn_t stores a single dpu_desc_index (opaque index into ctx->inbound[])
+ * instead of copying 4 routing metadata fields. The library (dpumesh.c) owns
+ * the metadata; the handler just passes the index through.
+ */
+static void on_upstream_response_cb(evutil_socket_t fd, short what, void *arg);
 
-static void on_response(dpumesh_req_id req_id,
-                         const dpumesh_response_t *resp,
-                         void *user_data) {
-    (void)user_data;
-
-    dpu_conn_t *uc = pending_remove(req_id);
-    if (!uc) {
-        fprintf(stderr, "[dpumesh] unknown response req_id=%u\n", req_id);
-        return;
-    }
-
-    int status = resp->status_code > 0 ? resp->status_code : 200;
-    const char *body = resp->body ? resp->body : "";
-    size_t body_len = resp->body_len;
-
-    uc->base.rlen = snprintf(uc->base.rbuf, sizeof(uc->base.rbuf),
-        "HTTP/1.1 %d OK\r\n"
-        "Content-Length: %zu\r\n"
-        "\r\n"
-        "%.*s",
-        status, body_len, (int)body_len, body);
-
-    http_response_t http_resp;
-    int ret = http_parse_response(&http_resp, uc->base.rbuf, uc->base.rlen);
-    if (ret == 0 && g_dpu_upstream_handler)
-        g_dpu_upstream_handler(&uc->base, &http_resp);
-    dpu_conn_free(uc);
-}
+/* ====== Inbound: notify_fd readable → dpumesh_read → request handler ====== */
 
 static void on_request(const dpumesh_request_t *req, void *user_data) {
     (void)user_data;
@@ -97,13 +61,8 @@ static void on_request(const dpumesh_request_t *req, void *user_data) {
     dpu_conn_t *c = dpu_conn_alloc();
     if (!c) return;
 
-    /* Store dpumesh metadata for later dpumesh_conn_respond() */
-    snprintf(c->dpu_req_id_str, sizeof(c->dpu_req_id_str), "%s",
-             req->req_id_str);
-    snprintf(c->dpu_source_worker, sizeof(c->dpu_source_worker), "%s",
-             req->source_worker);
-    c->dpu_case_flag = req->_case_flag;
-    c->dpu_req_id = req->req_id;
+    /* Store descriptor index for later dpumesh_conn_respond() */
+    c->dpu_desc_index = req->_desc_index;
 
     /* Format as HTTP request for http_parse_request() */
     const char *method = req->method ? req->method : "GET";
@@ -142,31 +101,64 @@ static void on_request(const dpumesh_request_t *req, void *user_data) {
     /* Don't free — handler owns it, will call dpumesh_conn_respond */
 }
 
-/* ====== Notify fd callback ====== */
-
 static void on_notify_cb(evutil_socket_t fd, short what, void *arg) {
     (void)fd; (void)what; (void)arg;
-    dpumesh_poll(g_dpu_ctx, on_response, NULL, on_request, NULL);
+    dpumesh_read(g_dpu_ctx, on_request, NULL);
 }
 
-/* ====== Public API ====== */
+/* ====== Per-request: respond ====== */
 
 void dpumesh_conn_respond(conn_t *client,
                           int status, const char *body, size_t body_len) {
     dpu_conn_t *dc = (dpu_conn_t *)client;
 
-    /* Reconstruct dpumesh_request_t from stored metadata */
+    /* Reconstruct dpumesh_request_t with descriptor index */
     dpumesh_request_t req;
     memset(&req, 0, sizeof(req));
-    snprintf(req.req_id_str, sizeof(req.req_id_str), "%s", dc->dpu_req_id_str);
-    snprintf(req.source_worker, sizeof(req.source_worker), "%s",
-             dc->dpu_source_worker);
-    req.req_id = dc->dpu_req_id;
-    req._case_flag = dc->dpu_case_flag;
+    req._desc_index = dc->dpu_desc_index;
 
-    dpumesh_respond(g_dpu_ctx, &req, status, body, body_len);
+    dpumesh_msg_t msg = {0};
+    msg.type = DPUMESH_MSG_RESPONSE;
+    msg.status_code = status;
+    msg.orig_req = &req;
+    msg.body = body;
+    msg.body_len = body_len;
+    dpumesh_write(g_dpu_ctx, &msg, NULL, NULL);
 
     dpu_conn_free(dc);
+}
+
+/* ====== Per-request: upstream ====== */
+
+static void on_upstream_response_cb(evutil_socket_t fd, short what, void *arg) {
+    (void)what;
+    dpu_conn_t *uc = arg;
+
+    dpumesh_response_t resp;
+    if (dpumesh_read_response(g_dpu_ctx, fd, &resp) < 0) {
+        dpu_conn_free(uc);
+        return;
+    }
+
+    /* fd is closed by dpumesh_read_response, clear so dpu_conn_free won't double-close */
+    uc->base.fd = -1;
+
+    int status = resp.status_code > 0 ? resp.status_code : 200;
+    const char *body = resp.body ? resp.body : "";
+    size_t body_len = resp.body_len;
+
+    uc->base.rlen = snprintf(uc->base.rbuf, sizeof(uc->base.rbuf),
+        "HTTP/1.1 %d OK\r\n"
+        "Content-Length: %zu\r\n"
+        "\r\n"
+        "%.*s",
+        status, body_len, (int)body_len, body);
+
+    http_response_t http_resp;
+    int ret = http_parse_response(&http_resp, uc->base.rbuf, uc->base.rlen);
+    if (ret == 0 && g_dpu_upstream_handler)
+        g_dpu_upstream_handler(&uc->base, &http_resp);
+    dpu_conn_free(uc);
 }
 
 int dpumesh_conn_upstream(conn_t *client,
@@ -179,26 +171,31 @@ int dpumesh_conn_upstream(conn_t *client,
     uc->base.client_conn = client;
     uc->base.handler_ctx = handler_ctx;
 
-    /* Copy dpumesh metadata from client for chained responses */
-    snprintf(uc->dpu_req_id_str, sizeof(uc->dpu_req_id_str), "%s",
-             dc->dpu_req_id_str);
-    snprintf(uc->dpu_source_worker, sizeof(uc->dpu_source_worker), "%s",
-             dc->dpu_source_worker);
-    uc->dpu_case_flag = dc->dpu_case_flag;
-    uc->dpu_req_id = dc->dpu_req_id;
+    /* Copy descriptor index from client for chained responses */
+    uc->dpu_desc_index = dc->dpu_desc_index;
 
-    /* Send request via SHM */
-    uint32_t req_id = dpumesh_send(g_dpu_ctx, method, url, NULL, NULL, 0);
-    if (req_id == 0) {
+    /* Send request via SHM — get per-request response fd */
+    dpumesh_msg_t msg = {0};
+    msg.type = DPUMESH_MSG_REQUEST;
+    msg.method = method;
+    msg.url = url;
+    dpumesh_req_id req_id;
+    int response_fd;
+    if (dpumesh_write(g_dpu_ctx, &msg, &req_id, &response_fd) < 0) {
         free(uc);
         return -1;
     }
 
-    /* Register for response matching */
-    pending_add(req_id, uc);
+    /* Register response fd with libevent (same pattern as TCP!) */
+    uc->base.fd = response_fd;
+    uc->base.ev = event_new(g_dpu_base, response_fd, EV_READ,
+                             on_upstream_response_cb, uc);
+    event_add(uc->base.ev, NULL);
 
     return 0;
 }
+
+/* ====== Public API ====== */
 
 int dpumesh_handler_init(struct event_base *base, dpumesh_ctx_t *dpu_ctx,
                           request_handler_fn handler) {
