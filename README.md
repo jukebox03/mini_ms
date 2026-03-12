@@ -136,6 +136,71 @@ tcp_handler_set_upstream(handle_upstream);  dpumesh_handler_set_upstream(handle_
 - TCP: `ID_SERVICE_HOST/PORT`, `ATTEND_SERVICE_HOST/PORT`
 - DPUmesh: `SHM_PREFIX` (SHM namespace, 기본값 `"dpumesh"`), `NAMESPACE` (k8s)
 
+## DPUmesh 핵심 설계: 두 채널 구조
+
+### `dpumesh_read` vs `dpumesh_read_response` — 왜 따로 있는가?
+
+두 함수는 **서로 다른 알림 채널**을 처리하기 때문에 분리되어 있다.
+
+| | `dpumesh_read` | `dpumesh_read_response` |
+|---|---|---|
+| **역할** | 외부에서 들어오는 **요청** 수신 | 업스트림에 보낸 **요청의 응답** 수신 |
+| **채널** | 공유 notify_fd (메인 파이프, 1개) | per-request response_fd (요청마다 1개) |
+| **호출 주체** | 이벤트 루프 → notify_fd readable 시 자동 호출 | 이벤트 루프 → response_fd readable 시 자동 호출 |
+| **읽는 대상** | SHM rx_sq에서 온 **inbound request** descriptor | 특정 요청에 대한 **response** descriptor |
+| **비유** | TCP의 `accept()` + `read()` on listen_fd | TCP의 `read()` on accepted connection fd |
+
+이 분리는 TCP 소켓의 동작 방식을 그대로 모방한 것이다:
+
+```
+TCP:                               DPUmesh:
+listen_fd  (broadcast)             notify_fd       (broadcast)
+  └─ accept() → conn_fd              └─ dpumesh_read() → on_request callback
+       └─ read(conn_fd)                    └─ dpumesh_write() → response_fd (unicast)
+                                                └─ dpumesh_read_response(response_fd)
+```
+
+- **`dpumesh_read()`**: notify_fd 하나에서 모든 수신 요청을 배치로 드레인한다. poller thread가 SHM rx_sq를 모니터링하다가 **request** descriptor가 오면 notify_fd pipe에 write → event loop가 깨어나 이 함수를 호출한다.
+- **`dpumesh_read_response()`**: **단 하나의 응답**만 읽는다. 해당 요청 전용 pipe fd에서 descriptor를 읽고, 읽은 즉시 pipe를 닫는다.
+
+### `response_fd`란 무엇인가?
+
+`response_fd`는 `dpumesh_write()`가 **DPUMESH_MSG_REQUEST** 타입(업스트림 요청)을 보낼 때 생성하는 **단일 요청 전용 pipe의 read-end fd**다.
+
+```
+                   dpumesh_write() 호출
+                         │
+                         ├─ tx_sq에 request descriptor 삽입 (SHM)
+                         │
+                         └─ pipe(rpfd) 생성
+                               ├─ rpfd[1] (write-end) → ctx->response_pipe_fds[req_id % DPUMESH_MAX_PENDING] 저장
+                               └─ rpfd[0] (read-end)  → *out_response_fd 로 반환  ← 이것이 response_fd
+```
+
+반환된 `response_fd`는 dpumesh_handler.c에서 libevent에 등록된다:
+
+```c
+// dpumesh_conn_upstream() 내부 동작 흐름
+int response_fd;
+dpumesh_write(ctx, &msg, &req_id, &response_fd);   // response_fd 획득
+
+uc->base.fd = response_fd;
+event_new(base, response_fd, EV_READ,              // libevent에 등록
+          on_upstream_response_cb, uc);
+```
+
+업스트림 서비스가 응답을 보내면:
+
+```
+업스트림 응답 → SHM rx_sq → poller thread 감지
+    → ctx->response_pipe_fds[req_id % DPUMESH_MAX_PENDING] 에 descriptor write
+    → response_fd readable
+    → libevent 콜백(on_upstream_response_cb) 호출
+    → dpumesh_read_response(ctx, response_fd, &resp) 로 응답 역직렬화
+```
+
+이 구조 덕분에 **동시에 여러 개의 업스트림 요청이 in-flight 상태**여도 각각이 독립적인 fd를 가지므로 libevent가 별도로 다중화할 수 있다. `DPUMESH_MAX_PENDING`(기본 256)이 동시에 처리할 수 있는 최대 in-flight 요청 수다.
+
 ## 참고
 
 ### `dpumesh_ctx_t` 내부 구조
