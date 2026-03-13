@@ -747,7 +747,7 @@ int dpumesh_read_response(dpumesh_ctx_t *ctx, int response_fd,
 }
 
 int dpumesh_write(dpumesh_ctx_t *ctx, const dpumesh_msg_t *msg,
-                  dpumesh_req_id *out_req_id, int *out_response_fd) {
+                  int *out_response_fd) {
     int header_slot = -1, body_slot = -1;
     uint32_t req_id;
     int8_t flags;
@@ -791,8 +791,6 @@ int dpumesh_write(dpumesh_ctx_t *ctx, const dpumesh_msg_t *msg,
                                    0, req_id_str,
                                    ctx->worker_id, "");
         flags = OP_REQUEST | CASE_LOCAL;
-
-        if (out_req_id) *out_req_id = req_id;
 
         /* Create per-request pipe for response delivery */
         if (out_response_fd) {

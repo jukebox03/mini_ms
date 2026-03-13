@@ -123,7 +123,7 @@ void dpumesh_conn_respond(conn_t *client,
     msg.orig_req = &req;
     msg.body = body;
     msg.body_len = body_len;
-    dpumesh_write(g_dpu_ctx, &msg, NULL, NULL);
+    dpumesh_write(g_dpu_ctx, &msg, NULL);
 
     dpu_conn_free(dc);
 }
@@ -179,9 +179,8 @@ int dpumesh_conn_upstream(conn_t *client,
     msg.type = DPUMESH_MSG_REQUEST;
     msg.method = method;
     msg.url = url;
-    dpumesh_req_id req_id;
     int response_fd;
-    if (dpumesh_write(g_dpu_ctx, &msg, &req_id, &response_fd) < 0) {
+    if (dpumesh_write(g_dpu_ctx, &msg, &response_fd) < 0) {
         free(uc);
         return -1;
     }

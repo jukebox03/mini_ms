@@ -151,14 +151,14 @@ int dpumesh_read_response(dpumesh_ctx_t *ctx, int response_fd,
 /*
  * Write a request or response to SHM.
  * msg->type determines behavior:
- *   DPUMESH_MSG_REQUEST:  sends to upstream service, sets *out_req_id,
+ *   DPUMESH_MSG_REQUEST:  sends to upstream service,
  *                         creates per-request pipe, returns read-end in *out_response_fd
  *   DPUMESH_MSG_RESPONSE: sends response back using msg->orig_req metadata
  *                         (out_response_fd ignored, pass NULL)
  * Returns 0 on success, -1 on failure.
  */
 int dpumesh_write(dpumesh_ctx_t *ctx, const dpumesh_msg_t *msg,
-                  dpumesh_req_id *out_req_id, int *out_response_fd);
+                  int *out_response_fd);
 
 /* ====== Buffer Management ====== */
 void dpumesh_request_free(dpumesh_ctx_t *ctx, const dpumesh_request_t *req);

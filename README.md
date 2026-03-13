@@ -58,7 +58,7 @@ make all      # 둘 다
 | notify fd 획득 | listen fd (socket 자체) | `dpumesh_get_notify_fd(ctx)` |
 | 요청 수신 | `read(fd, buf, len)` | `dpumesh_read(ctx, on_req, ..)` (notify fd에서 descriptor 읽기) |
 | 응답 수신 | `read(fd, buf, len)` | `dpumesh_read_response(ctx, response_fd, &resp)` (per-request fd) |
-| 데이터 송신 | `write(fd, buf, len)` | `dpumesh_write(ctx, &msg, &req_id, &response_fd)` (REQUEST 시 per-request response_fd 반환) |
+| 데이터 송신 | `write(fd, buf, len)` | `dpumesh_write(ctx, &msg, &response_fd)` (REQUEST 시 per-request response_fd 반환) |
 | 정리 | `close(fd)` | `dpumesh_destroy(ctx)` |
 | 알림 메커니즘 | kernel이 fd를 readable로 전환 | 내부 poller thread가 pipe fd에 signal |
 
